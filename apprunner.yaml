@@ -9,4 +9,17 @@ run:
   runtime-version: 3.12
   command: cd src && uvicorn api.app:app --host 0.0.0.0 --port 8080
   network:
-    port: 8080 
+    port: 8080
+  env:
+    - name: AWS_ACCESS_KEY_ID
+      value: AKIA47CRUUCW5MM3CFNZ
+    - name: AWS_DEFAULT_REGION
+      value: us-east-1
+    - name: AWS_REGION
+      value: us-east-1
+    - name: DEFAULT_MODEL
+      value: anthropic.claude-3-sonnet-20240229-v1:0
+    - name: DEFAULT_EMBEDDING_MODEL
+      value: cohere.embed-multilingual-v3
+    - name: DEBUG
+      value: "true" 
