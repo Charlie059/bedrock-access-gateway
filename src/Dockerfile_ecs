@@ -7,6 +7,10 @@ COPY ./requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --upgrade -r /app/requirements.txt
 
 COPY ./api /app/api
+COPY ./model /app/model
+
+# 确保 model 目录存在并有正确的权限
+RUN mkdir -p /app/model && chmod 755 /app/model
 
 ENV PORT=80
 

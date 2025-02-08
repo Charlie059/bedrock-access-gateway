@@ -5,6 +5,7 @@ import re
 import time
 from abc import ABC
 from typing import AsyncIterable, Iterable, Literal
+import os
 
 import boto3
 import numpy as np
@@ -12,6 +13,7 @@ import requests
 import tiktoken
 from botocore.config import Config
 from fastapi import HTTPException
+from transformers import AutoTokenizer
 
 from api.models.base import BaseChatModel, BaseEmbeddingsModel
 from api.schema import (
@@ -36,13 +38,19 @@ from api.schema import (
     EmbeddingsResponse,
     EmbeddingsUsage,
     Embedding,
-
 )
 from api.setting import DEBUG, AWS_REGION, ENABLE_CROSS_REGION_INFERENCE, DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 
-config = Config(connect_timeout=60, read_timeout=120, retries={"max_attempts": 1})
+# Default Hugging Face model ID
+DEFAULT_HF_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+
+config = Config(
+    connect_timeout=300,  # 5 minutes
+    read_timeout=300,     # 5 minutes
+    retries={'max_attempts': 3}
+)
 
 bedrock_runtime = boto3.client(
     service_name="bedrock-runtime",
@@ -55,6 +63,8 @@ bedrock_client = boto3.client(
     config=config,
 )
 
+# Store model tokenizers
+model_tokenizers = {}
 
 def get_inference_region_prefix():
     if AWS_REGION.startswith('ap-'):
@@ -123,6 +133,26 @@ def list_bedrock_models() -> dict:
                     'modalities': input_modalities
                 }
 
+        # List imported models
+        response = bedrock_client.list_imported_models()
+        print("=== Imported Models Response ===")
+        print(response)
+        if 'modelSummaries' in response:
+            for model in response['modelSummaries']:
+                print("Processing model:", model)
+                model_name = model.get('modelName', '')
+                model_arn = model.get('modelArn', '')
+                if model_name:
+                    print("Adding model: {model_name} with ARN: {model_arn}")
+                    model_list[model_name] = {
+                        'modalities': ['TEXT'],  # Default support for text modality
+                        'imported': True,
+                        'modelArn': model_arn,
+                        'modelId': model_arn,  # Use full ARN as modelId
+                        'modelArchitecture': model.get('modelArchitecture', ''),
+                        'instructSupported': model.get('instructSupported', False)
+                    }
+    
     except Exception as e:
         logger.error(f"Unable to list models: {str(e)}")
 
@@ -162,13 +192,91 @@ class BedrockModel(BaseChatModel):
 
     def _invoke_bedrock(self, chat_request: ChatRequest, stream=False):
         """Common logic for invoke bedrock models"""
-        if DEBUG:
-            logger.info("Raw request: " + chat_request.model_dump_json())
 
-        # convert OpenAI chat request to Bedrock SDK request
+        # Check if it's an imported model
+        model = bedrock_model_list.get(chat_request.model, {})
+        is_imported = model.get('imported', False)
+        
+        if is_imported:
+            try:
+                # Initialize or get tokenizer
+                if chat_request.model not in model_tokenizers:
+                    # Always use default HF model ID
+                    logger.info(f"Loading tokenizer for model: {DEFAULT_HF_MODEL_ID}")
+                    model_tokenizers[chat_request.model] = AutoTokenizer.from_pretrained(DEFAULT_HF_MODEL_ID)
+                
+                # Process messages
+                messages = self._parse_messages(chat_request)
+                formatted_messages = []
+                for msg in messages:
+                    content = ""
+                    if isinstance(msg['content'], list) and msg['content']:
+                        content = msg['content'][0].get('text', '')
+                    formatted_messages.append({
+                        'role': msg['role'],
+                        'content': content
+                    })
+
+                # Use tokenizer to build prompt
+                prompt = model_tokenizers[chat_request.model].apply_chat_template(
+                    formatted_messages, 
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                logger.info(f"Prompt: {prompt}")
+
+                body = json.dumps({
+                    "prompt": prompt,
+                    "max_gen_len": chat_request.max_tokens,
+                    "temperature": chat_request.temperature,
+                    "top_p": chat_request.top_p
+                })
+                
+                if stream:
+                    response = bedrock_runtime.invoke_model_with_response_stream(
+                        body=body,
+                        modelId=model.get('modelArn'),
+                        accept="application/json",
+                        contentType="application/json"
+                    )
+                    return {
+                        "stream": response.get('body'),
+                    }
+                else:
+                    response = bedrock_runtime.invoke_model(
+                        body=body,
+                        modelId=model.get('modelArn'),
+                        accept="application/json",
+                        contentType="application/json"
+                    )
+                    response_body = json.loads(response.get('body').read())
+                
+                    # 从响应中获取生成的文本
+                    generated_text = response_body.get('generation', '')
+                
+                    # 转换成与非导入模型相同的响应格式
+                    return {
+                        "output": {
+                            "message": {
+                                "content": [{"text": generated_text}]
+                            }
+                        },
+                        "usage": {
+                            "inputTokens": response_body.get('prompt_token_count', 0),
+                            "outputTokens": response_body.get('generation_token_count', 0)
+                        },
+                        "stopReason": response_body.get('stop_reason', 'complete')
+                    }
+                
+            except bedrock_runtime.exceptions.ValidationException as e:
+                logger.error("Validation Error: " + str(e))
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                logger.error(f"Error in _invoke_bedrock: {str(e)}")
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        
         args = self._parse_request(chat_request)
-        if DEBUG:
-            logger.info("Bedrock request: " + json.dumps(str(args)))
 
         try:
             if stream:
@@ -202,8 +310,7 @@ class BedrockModel(BaseChatModel):
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
-        if DEBUG:
-            logger.info("Proxy response :" + chat_response.model_dump_json())
+       
         return chat_response
 
     def chat_stream(self, chat_request: ChatRequest) -> AsyncIterable[bytes]:
@@ -218,8 +325,6 @@ class BedrockModel(BaseChatModel):
             )
             if not stream_response:
                 continue
-            if DEBUG:
-                logger.info("Proxy response :" + stream_response.model_dump_json())
             if stream_response.choices:
                 yield self.stream_response_to_bytes(stream_response)
             elif (
@@ -414,8 +519,12 @@ class BedrockModel(BaseChatModel):
                 stop = [stop]
             inference_config["stopSequences"] = stop
 
+        # 检查是否是导入的模型
+        model = bedrock_model_list.get(chat_request.model, {})
+        model_id = model.get('modelId', chat_request.model)
+        
         args = {
-            "modelId": chat_request.model,
+            "modelId": model_id,
             "messages": messages,
             "system": system_prompts,
             "inferenceConfig": inference_config,
@@ -469,7 +578,7 @@ class BedrockModel(BaseChatModel):
                             function=ResponseFunction(
                                 name=tool["name"],
                                 arguments=json.dumps(tool["input"]),
-                            ),
+                            )
                         )
                     )
             message.tool_calls = tool_calls
@@ -504,13 +613,39 @@ class BedrockModel(BaseChatModel):
     def _create_response_stream(
             self, model_id: str, message_id: str, chunk: dict
     ) -> ChatStreamResponse | None:
-        """Parsing the Bedrock stream response chunk.
 
-        Ref: https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#message-inference-examples
-        """
-        if DEBUG:
-            logger.info("Bedrock response chunk: " + str(chunk))
+        # Check if it's an imported model response
+        model = bedrock_model_list.get(model_id, {})
+        is_imported = model.get('imported', False)
+        
+        if is_imported:
+            # Handle imported model stream response
+            try:
+                if 'chunk' in chunk and 'bytes' in chunk['chunk']:
+                    chunk_data = json.loads(chunk['chunk']['bytes'])
+                    
+                    if 'generation' in chunk_data:
+                        return ChatStreamResponse(
+                            id=message_id,
+                            model=model_id,
+                            choices=[
+                                ChoiceDelta(
+                                    index=0,
+                                    delta=ChatResponseMessage(
+                                        content=chunk_data['generation']
+                                    ),
+                                    logprobs=None,
+                                    finish_reason=self._convert_finish_reason(chunk_data.get('stop_reason')),
+                                )
+                            ],
+                            usage=None,
+                        )
+                return None
+            except Exception as e:
+                logger.error(f"Error processing stream chunk: {str(e)}")
+                return None
 
+        # Handle non-imported model stream response
         finish_reason = None
         message = None
         usage = None
@@ -711,9 +846,6 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
 
     def _invoke_model(self, args: dict, model_id: str):
         body = json.dumps(args)
-        if DEBUG:
-            logger.info("Invoke Bedrock Model: " + model_id)
-            logger.info("Bedrock request body: " + body)
         try:
             return bedrock_runtime.invoke_model(
                 body=body,
@@ -753,8 +885,6 @@ class BedrockEmbeddingsModel(BaseEmbeddingsModel, ABC):
                 total_tokens=input_tokens + output_tokens,
             ),
         )
-        if DEBUG:
-            logger.info("Proxy response :" + response.model_dump_json())
         return response
 
 
@@ -794,8 +924,6 @@ class CohereEmbeddingsModel(BedrockEmbeddingsModel):
             args=self._parse_args(embeddings_request), model_id=embeddings_request.model
         )
         response_body = json.loads(response.get("body").read())
-        if DEBUG:
-            logger.info("Bedrock response body: " + str(response_body))
 
         return self._create_response(
             embeddings=response_body["embeddings"],
@@ -835,8 +963,6 @@ class TitanEmbeddingsModel(BedrockEmbeddingsModel):
             args=self._parse_args(embeddings_request), model_id=embeddings_request.model
         )
         response_body = json.loads(response.get("body").read())
-        if DEBUG:
-            logger.info("Bedrock response body: " + str(response_body))
 
         return self._create_response(
             embeddings=[response_body["embedding"]],
@@ -847,8 +973,6 @@ class TitanEmbeddingsModel(BedrockEmbeddingsModel):
 
 def get_embeddings_model(model_id: str) -> BedrockEmbeddingsModel:
     model_name = SUPPORTED_BEDROCK_EMBEDDING_MODELS.get(model_id, "")
-    if DEBUG:
-        logger.info("model name is " + model_name)
     match model_name:
         case "Cohere Embed Multilingual" | "Cohere Embed English":
             return CohereEmbeddingsModel()
