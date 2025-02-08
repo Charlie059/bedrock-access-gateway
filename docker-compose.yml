@@ -50,8 +50,9 @@ services:
       - 'WEBUI_SECRET_KEY='
       - 'WEBUI_DB_HOST=webui-db'
       - 'DATABASE_URL=postgresql://myapp_user:myapp_pass@webui-db:5431/myapp_db'
-      - 'OPENAI_API_BASE=http://bedrock-gateway/api/v1'
+      - 'OPENAI_API_BASE_URL=http://bedrock-gateway/api/v1'
       - 'OPENAI_API_KEY=bedrock'
+      - 'AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST=600'
     networks:
       - app-network
     extra_hosts:

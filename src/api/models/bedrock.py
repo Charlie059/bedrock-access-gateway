@@ -190,7 +190,7 @@ class BedrockModel(BaseChatModel):
                 detail=error,
             )
 
-    def _invoke_with_retry(self, model_arn: str, body: str, stream: bool = False, max_retries: int = 3, retry_delay: int = 30) -> dict:
+    def _invoke_with_retry(self, model_arn: str, body: str, stream: bool = False, max_retries: int = 6, retry_delay: int = 50) -> dict:
         """Helper method to invoke bedrock model with retry logic"""
         attempt = 0
         while attempt < max_retries:
