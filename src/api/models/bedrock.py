@@ -190,6 +190,52 @@ class BedrockModel(BaseChatModel):
                 detail=error,
             )
 
+    def _invoke_with_retry(self, model_arn: str, body: str, stream: bool = False, max_retries: int = 3, retry_delay: int = 30) -> dict:
+        """Helper method to invoke bedrock model with retry logic"""
+        attempt = 0
+        while attempt < max_retries:
+            try:
+                if stream:
+                    response = bedrock_runtime.invoke_model_with_response_stream(
+                        body=body,
+                        modelId=model_arn,
+                        accept="application/json",
+                        contentType="application/json"
+                    )
+                    return {
+                        "stream": response.get('body'),
+                    }
+                else:
+                    response = bedrock_runtime.invoke_model(
+                        body=body,
+                        modelId=model_arn,
+                        accept="application/json",
+                        contentType="application/json"
+                    )
+                    response_body = json.loads(response.get('body').read())
+                    return {
+                        "output": {
+                            "message": {
+                                "content": [{"text": response_body.get('generation', '')}]
+                            }
+                        },
+                        "usage": {
+                            "inputTokens": response_body.get('prompt_token_count', 0),
+                            "outputTokens": response_body.get('generation_token_count', 0)
+                        },
+                        "stopReason": response_body.get('stop_reason', 'complete')
+                    }
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
+                attempt += 1
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to get response after {max_retries} retries: {str(e)}"
+                    )
+
     def _invoke_bedrock(self, chat_request: ChatRequest, stream=False):
         """Common logic for invoke bedrock models"""
 
@@ -232,45 +278,11 @@ class BedrockModel(BaseChatModel):
                     "top_p": chat_request.top_p
                 })
                 
-                if stream:
-                    response = bedrock_runtime.invoke_model_with_response_stream(
-                        body=body,
-                        modelId=model.get('modelArn'),
-                        accept="application/json",
-                        contentType="application/json"
-                    )
-                    return {
-                        "stream": response.get('body'),
-                    }
-                else:
-                    response = bedrock_runtime.invoke_model(
-                        body=body,
-                        modelId=model.get('modelArn'),
-                        accept="application/json",
-                        contentType="application/json"
-                    )
-                    response_body = json.loads(response.get('body').read())
-                
-                    # 从响应中获取生成的文本
-                    generated_text = response_body.get('generation', '')
-                
-                    # 转换成与非导入模型相同的响应格式
-                    return {
-                        "output": {
-                            "message": {
-                                "content": [{"text": generated_text}]
-                            }
-                        },
-                        "usage": {
-                            "inputTokens": response_body.get('prompt_token_count', 0),
-                            "outputTokens": response_body.get('generation_token_count', 0)
-                        },
-                        "stopReason": response_body.get('stop_reason', 'complete')
-                    }
-                
-            except bedrock_runtime.exceptions.ValidationException as e:
-                logger.error("Validation Error: " + str(e))
-                raise HTTPException(status_code=400, detail=str(e))
+                return self._invoke_with_retry(
+                    model_arn=model.get('modelArn'),
+                    body=body,
+                    stream=stream
+                )
             except Exception as e:
                 logger.error(f"Error in _invoke_bedrock: {str(e)}")
                 raise HTTPException(status_code=500, detail=str(e))
@@ -519,7 +531,7 @@ class BedrockModel(BaseChatModel):
                 stop = [stop]
             inference_config["stopSequences"] = stop
 
-        # 检查是否是导入的模型
+    
         model = bedrock_model_list.get(chat_request.model, {})
         model_id = model.get('modelId', chat_request.model)
         
