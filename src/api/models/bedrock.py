@@ -146,7 +146,7 @@ def list_bedrock_models() -> dict:
                 model_arn = model.get('modelArn', '')
                 if model_name:
                     print("Adding model: {model_name} with ARN: {model_arn}")
-                    model_list[model_name] = {
+                    model_list[model_name + " (cold start)"] = {
                         'modalities': ['TEXT'],  # Default support for text modality
                         'imported': True,
                         'modelArn': model_arn,
