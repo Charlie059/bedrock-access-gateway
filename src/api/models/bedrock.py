@@ -158,6 +158,8 @@ def list_bedrock_models() -> dict:
         # List marketplace models
         try:
             response = bedrock_client.list_marketplace_model_endpoints()
+            logger.info(f"=== Marketplace Models Response ===")
+            logger.info(response)
             if 'marketplaceModelEndpoints' in response:
                 for model in response['marketplaceModelEndpoints']:
                     endpoint_arn = model.get('endpointArn', '')
