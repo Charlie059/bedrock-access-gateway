@@ -164,7 +164,7 @@ def list_bedrock_models() -> dict:
                     if endpoint_arn and model.get('status') == 'REGISTERED':
                         # Extract endpoint name from ARN
                         endpoint_name = endpoint_arn.split('/')[-1]
-                        model_list[endpoint_name] = {
+                        model_list[endpoint_name + " (NVIDIA L4 - No Streaming)"] = {
                             'modalities': ['TEXT'],  # Default support for text modality
                             'marketplace': True,
                             'endpointArn': endpoint_arn,
@@ -216,14 +216,14 @@ class BedrockModel(BaseChatModel):
         attempt = 0
         while attempt < max_retries:
             try:
-                # 检查是否为marketplace模型
+                # Check if it's a marketplace model
                 model = next((m for m in bedrock_model_list.values() if m.get('endpointArn') == model_arn), None)
                 is_marketplace = model and model.get('marketplace', False)
 
-                # marketplace模型不支持流式调用,需要模拟流式返回
+                # Marketplace models do not support streaming, so we need to simulate streaming
                 if is_marketplace and stream:
                     logging.info(f"is_marketplace: {is_marketplace}, stream: {stream}")
-                    # 先进行非流式调用
+                    # First, perform a non-streaming call
                     response = bedrock_runtime.invoke_model(
                         body=body,
                         modelId=model_arn,
@@ -233,9 +233,15 @@ class BedrockModel(BaseChatModel):
                     response_body = json.loads(response.get('body').read())
                     generated_text = response_body.get('generated_text', '')
                     
-                    # 模拟流式返回
+                    # Process <think> tags
+                    if '<think>' in generated_text:
+                        # Keep <think> tags, remove content before the tag
+                        parts = generated_text.split('<think>')
+                        generated_text = '<think>' + parts[-1].strip()
+                    
+                    # Simulate streaming return
                     chunks = []
-                    # 1. 开始标记
+                    # 1. Start marker
                     chunks.append({
                         "chunk": {
                             "bytes": json.dumps({
@@ -243,7 +249,7 @@ class BedrockModel(BaseChatModel):
                             }).encode()
                         }
                     })
-                    # 2. 内容
+                    # 2. Content
                     if generated_text:
                         chunks.append({
                             "chunk": {
@@ -252,7 +258,7 @@ class BedrockModel(BaseChatModel):
                                 }).encode()
                             }
                         })
-                    # 3. 结束标记
+                    # 3. End marker
                     chunks.append({
                         "chunk": {
                             "bytes": json.dumps({
@@ -281,16 +287,24 @@ class BedrockModel(BaseChatModel):
                         contentType="application/json"
                     )
                     response_body = json.loads(response.get('body').read())
-                    # 根据模型类型返回不同的响应格式
+                    generated_text = response_body.get('generated_text', '')
+                    
+                    # Process <think> tags
+                    if '<think>' in generated_text:
+                        # Keep <think> tags, remove content before the tag
+                        parts = generated_text.split('<think>')
+                        generated_text = '<think>' + parts[-1].strip()
+                    
+                    # Return different response formats based on model type
                     if is_marketplace:
                         return {
                             "output": {
                                 "message": {
-                                    "content": [{"text": response_body.get('generated_text', '')}]
+                                    "content": [{"text": generated_text}]
                                 }
                             },
                             "usage": {
-                                "inputTokens": 0,  # marketplace模型不提供token计数
+                                "inputTokens": 0,  # Marketplace models do not provide token counting
                                 "outputTokens": 0
                             },
                             "stopReason": "complete"
