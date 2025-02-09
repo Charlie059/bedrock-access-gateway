@@ -92,6 +92,8 @@ def list_bedrock_models() -> dict:
     Returns a model list combines:
         - ON_DEMAND models.
         - Cross-Region Inference Profiles (if enabled via Env)
+        - Imported models
+        - Marketplace models
     """
     model_list = {}
     try:
@@ -152,6 +154,25 @@ def list_bedrock_models() -> dict:
                         'modelArchitecture': model.get('modelArchitecture', ''),
                         'instructSupported': model.get('instructSupported', False)
                     }
+
+        # List marketplace models
+        try:
+            response = bedrock_client.list_marketplace_model_endpoints()
+            if 'marketplaceModelEndpoints' in response:
+                for model in response['marketplaceModelEndpoints']:
+                    endpoint_arn = model.get('endpointArn', '')
+                    if endpoint_arn and model.get('status') == 'REGISTERED':
+                        # Extract endpoint name from ARN
+                        endpoint_name = endpoint_arn.split('/')[-1]
+                        model_list[endpoint_name] = {
+                            'modalities': ['TEXT'],  # Default support for text modality
+                            'marketplace': True,
+                            'endpointArn': endpoint_arn,
+                            'modelId': endpoint_arn,  # Use endpoint ARN as modelId
+                            'modelSourceIdentifier': model.get('modelSourceIdentifier', '')
+                        }
+        except Exception as e:
+            logger.error(f"Error listing marketplace models: {str(e)}")
     
     except Exception as e:
         logger.error(f"Unable to list models: {str(e)}")
@@ -195,7 +216,54 @@ class BedrockModel(BaseChatModel):
         attempt = 0
         while attempt < max_retries:
             try:
-                if stream:
+                # 检查是否为marketplace模型
+                model = next((m for m in bedrock_model_list.values() if m.get('endpointArn') == model_arn), None)
+                is_marketplace = model and model.get('marketplace', False)
+
+                # marketplace模型不支持流式调用,需要模拟流式返回
+                if is_marketplace and stream:
+                    logging.info(f"is_marketplace: {is_marketplace}, stream: {stream}")
+                    # 先进行非流式调用
+                    response = bedrock_runtime.invoke_model(
+                        body=body,
+                        modelId=model_arn,
+                        accept="application/json",
+                        contentType="application/json"
+                    )
+                    response_body = json.loads(response.get('body').read())
+                    generated_text = response_body.get('generated_text', '')
+                    
+                    # 模拟流式返回
+                    chunks = []
+                    # 1. 开始标记
+                    chunks.append({
+                        "chunk": {
+                            "bytes": json.dumps({
+                                "delta": {"role": "assistant"}
+                            }).encode()
+                        }
+                    })
+                    # 2. 内容
+                    if generated_text:
+                        chunks.append({
+                            "chunk": {
+                                "bytes": json.dumps({
+                                    "delta": {"content": generated_text}
+                                }).encode()
+                            }
+                        })
+                    # 3. 结束标记
+                    chunks.append({
+                        "chunk": {
+                            "bytes": json.dumps({
+                                "finish_reason": "stop"
+                            }).encode()
+                        }
+                    })
+                    return {
+                        "stream": iter(chunks)
+                    }
+                elif stream:
                     response = bedrock_runtime.invoke_model_with_response_stream(
                         body=body,
                         modelId=model_arn,
@@ -213,18 +281,33 @@ class BedrockModel(BaseChatModel):
                         contentType="application/json"
                     )
                     response_body = json.loads(response.get('body').read())
-                    return {
-                        "output": {
-                            "message": {
-                                "content": [{"text": response_body.get('generation', '')}]
-                            }
-                        },
-                        "usage": {
-                            "inputTokens": response_body.get('prompt_token_count', 0),
-                            "outputTokens": response_body.get('generation_token_count', 0)
-                        },
-                        "stopReason": response_body.get('stop_reason', 'complete')
-                    }
+                    # 根据模型类型返回不同的响应格式
+                    if is_marketplace:
+                        return {
+                            "output": {
+                                "message": {
+                                    "content": [{"text": response_body.get('generated_text', '')}]
+                                }
+                            },
+                            "usage": {
+                                "inputTokens": 0,  # marketplace模型不提供token计数
+                                "outputTokens": 0
+                            },
+                            "stopReason": "complete"
+                        }
+                    else:
+                        return {
+                            "output": {
+                                "message": {
+                                    "content": [{"text": response_body.get('generation', '')}]
+                                }
+                            },
+                            "usage": {
+                                "inputTokens": response_body.get('prompt_token_count', 0),
+                                "outputTokens": response_body.get('generation_token_count', 0)
+                            },
+                            "stopReason": response_body.get('stop_reason', 'complete')
+                        }
             except Exception as e:
                 logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
                 attempt += 1
@@ -239,11 +322,12 @@ class BedrockModel(BaseChatModel):
     def _invoke_bedrock(self, chat_request: ChatRequest, stream=False):
         """Common logic for invoke bedrock models"""
 
-        # Check if it's an imported model
+        # Check if it's an imported model or marketplace model
         model = bedrock_model_list.get(chat_request.model, {})
         is_imported = model.get('imported', False)
+        is_marketplace = model.get('marketplace', False)
         
-        if is_imported:
+        if is_imported or is_marketplace:
             try:
                 # Initialize or get tokenizer
                 if chat_request.model not in model_tokenizers:
@@ -271,15 +355,28 @@ class BedrockModel(BaseChatModel):
                 )
                 logger.info(f"Prompt: {prompt}")
 
-                body = json.dumps({
-                    "prompt": prompt,
-                    "max_gen_len": chat_request.max_tokens,
-                    "temperature": chat_request.temperature,
-                    "top_p": chat_request.top_p
-                })
+                if is_marketplace:
+                    body = json.dumps({
+                        "inputs": prompt,
+                        "parameters": {
+                            "max_new_tokens": chat_request.max_tokens,
+                            "temperature": chat_request.temperature,
+                            "top_p": min(max(chat_request.top_p if chat_request.top_p is not None else 0.9, 0.01), 0.99),
+                            "stop": []
+                        }
+                    })
+                    model_id = model.get('endpointArn')
+                else:
+                    body = json.dumps({
+                        "prompt": prompt,
+                        "max_gen_len": chat_request.max_tokens,
+                        "temperature": chat_request.temperature,
+                        "top_p": chat_request.top_p
+                    })
+                    model_id = model.get('modelArn')
                 
                 return self._invoke_with_retry(
-                    model_arn=model.get('modelArn'),
+                    model_arn=model_id,
                     body=body,
                     stream=stream
                 )
@@ -287,7 +384,7 @@ class BedrockModel(BaseChatModel):
                 logger.error(f"Error in _invoke_bedrock: {str(e)}")
                 raise HTTPException(status_code=500, detail=str(e))
         
-        
+        # For foundation models, use converse API
         args = self._parse_request(chat_request)
 
         try:
@@ -590,7 +687,7 @@ class BedrockModel(BaseChatModel):
                             function=ResponseFunction(
                                 name=tool["name"],
                                 arguments=json.dumps(tool["input"]),
-                            )
+                            ),
                         )
                     )
             message.tool_calls = tool_calls
@@ -626,17 +723,35 @@ class BedrockModel(BaseChatModel):
             self, model_id: str, message_id: str, chunk: dict
     ) -> ChatStreamResponse | None:
 
-        # Check if it's an imported model response
+        # Check if it's an imported model or marketplace model response
         model = bedrock_model_list.get(model_id, {})
         is_imported = model.get('imported', False)
+        is_marketplace = model.get('marketplace', False)
         
-        if is_imported:
-            # Handle imported model stream response
+        if is_imported or is_marketplace:
+            # Handle imported/marketplace model stream response
             try:
                 if 'chunk' in chunk and 'bytes' in chunk['chunk']:
                     chunk_data = json.loads(chunk['chunk']['bytes'])
                     
-                    if 'generation' in chunk_data:
+                    if 'delta' in chunk_data:
+                        return ChatStreamResponse(
+                            id=message_id,
+                            model=model_id,
+                            choices=[
+                                ChoiceDelta(
+                                    index=0,
+                                    delta=ChatResponseMessage(
+                                        role=chunk_data['delta'].get('role'),
+                                        content=chunk_data['delta'].get('content')
+                                    ),
+                                    logprobs=None,
+                                    finish_reason=chunk_data.get('finish_reason'),
+                                )
+                            ],
+                            usage=None,
+                        )
+                    elif 'generation' in chunk_data:
                         return ChatStreamResponse(
                             id=message_id,
                             model=model_id,
